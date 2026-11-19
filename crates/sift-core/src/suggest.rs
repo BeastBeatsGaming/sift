@@ -2,7 +2,7 @@ use crate::dupes::find_duplicates;
 use crate::model::*;
 use crate::rules::{self, KnownAction, KNOWN_LOCATIONS, SPECIAL_EXTS};
 use crate::scan::path_size;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -38,7 +38,7 @@ impl Default for SuggestOptions {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Report {
     pub suggestions: Vec<Suggestion>,
     pub duplicates: Vec<DuplicateGroup>,
@@ -67,18 +67,20 @@ pub fn suggest(scan: &ScanResult, opts: &SuggestOptions) -> Report {
             continue;
         }
         items.sort_unstable_by(|a, b| b.bytes.cmp(&a.bytes));
+        let action = match loc.action {
+            KnownAction::Quarantine => Action::Quarantine { contents: true },
+            KnownAction::Command(p, a) => Action::Command { program: p.into(), args: a.iter().map(|s| s.to_string()).collect() },
+            KnownAction::Settings(u) => Action::OpenSettings { uri: u.into() },
+            KnownAction::Manual => Action::Manual,
+        };
         out.push(Suggestion {
             id: loc.id.into(),
             title: loc.label.into(),
             bytes,
             safety: loc.safety,
             how: loc.how.into(),
-            action: match loc.action {
-                KnownAction::Quarantine => Action::Quarantine { contents: true },
-                KnownAction::Command(p, a) => Action::Command { program: p.into(), args: a.iter().map(|s| s.to_string()).collect() },
-                KnownAction::Settings(u) => Action::OpenSettings { uri: u.into() },
-                KnownAction::Manual => Action::Manual,
-            },
+            permanent: is_permanent(loc.id, &action),
+            action,
             items,
         });
     }
@@ -102,6 +104,7 @@ pub fn suggest(scan: &ScanResult, opts: &SuggestOptions) -> Report {
             safety: rule.safety,
             how: rule.how.into(),
             action: Action::Quarantine { contents: false },
+            permanent: false,
             items,
         });
     }
@@ -122,6 +125,7 @@ pub fn suggest(scan: &ScanResult, opts: &SuggestOptions) -> Report {
             safety: rule.safety,
             how: rule.how.into(),
             action: Action::Quarantine { contents: false },
+            permanent: false,
             items,
         });
     }
@@ -144,6 +148,7 @@ pub fn suggest(scan: &ScanResult, opts: &SuggestOptions) -> Report {
             safety: Safety::Review,
             how: "Archive to another drive or your NAS if you still want them.".into(),
             action: Action::Quarantine { contents: false },
+            permanent: false,
             items: stale,
         });
     }
@@ -159,6 +164,7 @@ pub fn suggest(scan: &ScanResult, opts: &SuggestOptions) -> Report {
                 safety: Safety::Review,
                 how: "Old installers and archives are usually safe once installed or extracted.".into(),
                 action: Action::Quarantine { contents: false },
+                permanent: false,
                 items,
             });
         }
@@ -179,6 +185,7 @@ pub fn suggest(scan: &ScanResult, opts: &SuggestOptions) -> Report {
             safety: Safety::Review,
             how: "Same size and matching content samples. The oldest copy of each is kept; extras are listed.".into(),
             action: Action::Quarantine { contents: false },
+            permanent: false,
             items,
         });
     }
@@ -189,6 +196,17 @@ pub fn suggest(scan: &ScanResult, opts: &SuggestOptions) -> Report {
         report.forget(&opts.ignored, &[]);
     }
     report
+}
+
+/// Sift's own moves go to .sift-trash and can be undone; anything a command
+/// or Windows does can't. Manual steps are flagged when following them
+/// deletes for good.
+pub fn is_permanent(id: &str, action: &Action) -> bool {
+    match action {
+        Action::Quarantine { .. } => false,
+        Action::Command { .. } | Action::OpenSettings { .. } => true,
+        Action::Manual => matches!(id, "recycle_bin" | "trash"),
+    }
 }
 
 fn collect_regen(node: &DirNode, path: PathBuf, min: u64, out: &mut HashMap<&'static str, Vec<Located>>) {

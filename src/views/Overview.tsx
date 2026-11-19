@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { api, type BackgroundStatus, type Suggestion, type Summary } from "../api";
-import { Bar, Bytes, Meter, SafetyBadge, si } from "../components/ui";
+import { Bar, Bytes, Meter, SafetyBadge, si, NoUndo } from "../components/ui";
 import { bytes, count, pct } from "../format";
 import type { FreedSummary } from "../freed";
 
@@ -47,8 +47,8 @@ export function Overview({
 
   return (
     <div className="page">
-      <div className="page-head" style={{ marginBottom: 0 }}>
-        <div>
+      <div className="page-head ov-head">
+        <div className="ov-title">
           <span className="label">
             {summary.root_path} · {count(st.files)} files · {(st.elapsed_ms / 1000).toFixed(1)}s
           </span>
@@ -65,14 +65,14 @@ export function Overview({
             </b>
           </div>
           <div className="hero-side">
-            <div className="readout">
+            <div className="readout hero-stat">
               <span className="label">With review</span>
               <b className="lg" style={{ color: "var(--warn)" }}>
                 <Bytes n={review} />
               </b>
             </div>
             {hasDisk && (
-              <div className="readout">
+              <div className="readout hero-stat">
                 <span className="label">Drive free</span>
                 <b className="lg">
                   <Bytes n={summary.disk_free!} />
@@ -129,7 +129,12 @@ export function Overview({
             {actionable.slice(0, 7).map((s, i) => (
               <div className="row clickable" key={s.id} style={si(i)} onClick={goSuggestions}>
                 <span className="idx">{String(i + 1).padStart(2, "0")}</span>
-                <span className="row-main">{s.title}</span>
+                <span className="target-title">
+                  <span className="target-name" title={s.title}>
+                    {s.title}
+                  </span>
+                  {s.permanent && <NoUndo />}
+                </span>
                 <SafetyBadge safety={s.safety} />
                 <span className="num">{bytes(s.bytes)}</span>
               </div>
@@ -139,14 +144,18 @@ export function Overview({
         </section>
 
         <div className="span-5 col-stack">
-          <section className="card freed">
-            <div className="section-head">
+          <section className="card side-card">
+            <div className="panel-head">
               <span className="label">Freed / month</span>
               <span className="mono small" style={{ color: "var(--accent2)" }}>
                 TOTAL {bytes(freed.total)}
               </span>
             </div>
-            {freed.months.map((m, i) => (
+            <div className="side-body">
+            {freed.total === 0 ? (
+              <span className="muted small side-empty">Nothing freed yet. Each cleanup is counted here by month once you run one.</span>
+            ) : (
+              freed.months.map((m, i) => (
               <div key={m.key} className={`month-row ${i === freed.months.length - 1 ? "now" : ""}`} title={`${count(m.cleanups)} cleanup${m.cleanups === 1 ? "" : "s"}`}>
                 <span className="dim">{m.label.toUpperCase()}</span>
                 <span className="bar">
@@ -154,11 +163,15 @@ export function Overview({
                 </span>
                 <span className="num">{bytes(m.bytes)}</span>
               </div>
-            ))}
-            <span className="small muted">
-              {count(freed.cleanups)} cleanup{freed.cleanups === 1 ? "" : "s"}
-              {inTrash > 0 ? ` · ${bytes(inTrash)} still in .sift-trash` : ""}
-            </span>
+              ))
+            )}
+            {(freed.cleanups > 0 || inTrash > 0) && (
+              <span className="small muted">
+                {count(freed.cleanups)} cleanup{freed.cleanups === 1 ? "" : "s"}
+                {inTrash > 0 ? ` · ${bytes(inTrash)} still in .sift-trash` : ""}
+              </span>
+            )}
+            </div>
           </section>
 
           <section className="card watch">
@@ -180,17 +193,22 @@ export function Overview({
           </section>
 
           {info.length > 0 && (
-            <section className="card freed">
-              <span className="label" style={{ color: "var(--accent2)" }}>
-                Good to know
-              </span>
-              {info.map((s) => (
-                <div key={s.id} className="section-head">
-                  <span>{s.title.split(" — ")[0]}</span>
-                  <span className="num">{bytes(s.bytes)}</span>
-                </div>
-              ))}
-              <span className="small muted">Managed by Windows. Nothing to do.</span>
+            <section className="card side-card">
+              <div className="panel-head">
+                <span className="label" style={{ color: "var(--accent2)" }}>
+                  Good to know
+                </span>
+              </div>
+              <div className="list">
+                {info.map((s) => (
+                  <div key={s.id} className="row" title={s.how}>
+                    <span>{s.title.split(" — ")[0]}</span>
+                    <span />
+                    <span className="num">{bytes(s.bytes)}</span>
+                  </div>
+                ))}
+              </div>
+              <span className="small muted side-foot">Managed by Windows — shown so you know where the space went.</span>
             </section>
           )}
         </div>

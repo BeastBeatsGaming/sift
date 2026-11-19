@@ -57,13 +57,15 @@ fn forget(app: &AppHandle, moved: &[(PathBuf, u64)], remeasure: &[&str]) {
 
 fn changed(app: &AppHandle) {
     let _ = app.emit("data://changed", ());
+    crate::commands::persist(app);
 }
 
 /// Carry out a suggestion. `paths` limits it to some of its items; `None`
 /// means all of them (including ones beyond what the UI was sent).
 #[tauri::command]
 pub async fn clean_suggestion(app: AppHandle, id: String, paths: Option<Vec<String>>) -> Result<CleanResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    let log_id = id.clone();
+    let r = tauri::async_runtime::spawn_blocking(move || {
         let sugg = {
             let state = app.state::<AppState>();
             let g = state.data.read().unwrap();
@@ -131,13 +133,14 @@ pub async fn clean_suggestion(app: AppHandle, id: String, paths: Option<Vec<Stri
         }
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    crate::diag::note(&format!("clean_suggestion {log_id}"), r)
 }
 
 /// Move arbitrary paths (from Explorer, Large files, Duplicates) to the trash.
 #[tauri::command]
 pub async fn quarantine_paths(app: AppHandle, paths: Vec<String>, label: String) -> Result<CleanResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    let r = tauri::async_runtime::spawn_blocking(move || {
         let targets: Vec<(PathBuf, u64)> = {
             let state = app.state::<AppState>();
             let g = state.data.read().unwrap();
@@ -159,7 +162,8 @@ pub async fn quarantine_paths(app: AppHandle, paths: Vec<String>, label: String)
         Ok(CleanResult::from_outcome("quarantine", out))
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    crate::diag::note("quarantine_paths", r)
 }
 
 #[derive(Deserialize)]
@@ -174,7 +178,7 @@ pub struct DupePick {
 /// Every copy is compared in full against its keeper first; mismatches stay.
 #[tauri::command]
 pub async fn clean_duplicates(app: AppHandle, picks: Vec<DupePick>) -> Result<CleanResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    let r = tauri::async_runtime::spawn_blocking(move || {
         let picks: Vec<(PathBuf, Vec<PathBuf>)> = {
             let state = app.state::<AppState>();
             let g = state.data.read().unwrap();
@@ -194,7 +198,8 @@ pub async fn clean_duplicates(app: AppHandle, picks: Vec<DupePick>) -> Result<Cl
         quarantine_duplicates(&app, picks)
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    crate::diag::note("clean_duplicates", r)
 }
 
 fn quarantine_duplicates(app: &AppHandle, picks: Vec<(PathBuf, Vec<PathBuf>)>) -> Result<CleanResult, String> {
@@ -325,7 +330,7 @@ pub fn get_history(app: AppHandle) -> Result<HistoryView, String> {
 
 #[tauri::command]
 pub async fn restore_batch(app: AppHandle, id: String) -> Result<CleanResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    let r = tauri::async_runtime::spawn_blocking(move || {
         let out = with_trash(&app, |t| t.restore(&id))??;
         // Restored items aren't in the loaded scan any more; the UI offers a rescan.
         let _ = app.emit("data://stale", ());
@@ -333,31 +338,34 @@ pub async fn restore_batch(app: AppHandle, id: String) -> Result<CleanResult, St
         Ok(CleanResult::from_outcome("restore", out))
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    crate::diag::note("restore_batch", r)
 }
 
 #[tauri::command]
 pub async fn purge_batch(app: AppHandle, id: String) -> Result<CleanResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    let r = tauri::async_runtime::spawn_blocking(move || {
         let out = with_trash(&app, |t| t.purge(&id))??;
         refresh_disk(&app);
         changed(&app);
         Ok(CleanResult::from_outcome("purge", out))
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    crate::diag::note("purge_batch", r)
 }
 
 #[tauri::command]
 pub async fn empty_trash(app: AppHandle) -> Result<CleanResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    let r = tauri::async_runtime::spawn_blocking(move || {
         let out = with_trash(&app, |t| t.purge_all())?;
         refresh_disk(&app);
         changed(&app);
         Ok(CleanResult::from_outcome("purge", out))
     })
     .await
-    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())?;
+    crate::diag::note("empty_trash", r)
 }
 
 fn refresh_disk(app: &AppHandle) {

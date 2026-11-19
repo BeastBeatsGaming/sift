@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, type BatchView, type HistoryView } from "../api";
 import { useFeedback } from "../components/feedback";
-import { Bytes, Empty, si } from "../components/ui";
+import { Bytes, Empty, NoUndo, si } from "../components/ui";
 import { bytes, count } from "../format";
 import { summarizeFreed } from "../freed";
 
@@ -41,7 +41,11 @@ export function History({ version }: { version: number }) {
   async function purge(b: BatchView) {
     const ok = await fb.confirm({
       title: "Delete permanently?",
-      body: <p>“{b.label}” — {bytes(b.in_trash)}. This frees the space and can't be undone.</p>,
+      body: (
+        <p>
+          <NoUndo /> “{b.label}” — {bytes(b.in_trash)}. This frees the space; the items can't be restored afterwards.
+        </p>
+      ),
       confirm: "Delete",
       danger: true,
     });
@@ -51,7 +55,11 @@ export function History({ version }: { version: number }) {
   async function emptyAll() {
     const ok = await fb.confirm({
       title: "Empty .sift-trash?",
-      body: <p>Permanently deletes {bytes(h!.in_trash)} of moved items. Nothing in it can be restored afterwards.</p>,
+      body: (
+        <p>
+          <NoUndo /> Permanently deletes {bytes(h!.in_trash)} of moved items. Nothing in it can be restored afterwards.
+        </p>
+      ),
       confirm: "Empty trash",
       danger: true,
     });

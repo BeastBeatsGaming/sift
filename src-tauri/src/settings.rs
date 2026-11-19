@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::OnceLock;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use tauri::{AppHandle, Emitter, Manager};
 
 const MB: u64 = 1024 * 1024;
@@ -132,6 +132,7 @@ fn apply_ignored(app: &AppHandle, paths: &[PathBuf]) {
         l.report.forget(paths, &[]);
     }
     let _ = app.emit("data://changed", ());
+    crate::commands::persist(app);
 }
 
 // ------------------------------------------------------------------- admin
@@ -185,9 +186,56 @@ pub fn relaunch_as_admin(app: AppHandle) -> Result<(), String> {
 
 // ------------------------------------------------------------------- theme
 
+/// Where the rice palette lives. Checked in order, first file that exists wins:
+/// 1. `SIFT_PALETTE` — an explicit palette.json path
+/// 2. `RICE_HOME\palette.json` — the rice's own override
+/// 3. `~/.config/rice/palette.json` — the documented default
+/// 4. next to a running `rice.exe` — the rice writes palette.json beside itself,
+///    wherever its repo was cloned
+/// 5. `~/windows-rice/rice/palette.json` — the rice repo's usual clone spot,
+///    for when rice.exe isn't running yet
+fn find_palette() -> Option<PathBuf> {
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")).map(PathBuf::from);
+    let fixed = [
+        std::env::var_os("SIFT_PALETTE").map(PathBuf::from),
+        std::env::var_os("RICE_HOME").map(|d| PathBuf::from(d).join("palette.json")),
+        home.as_ref().map(|h| h.join(".config").join("rice").join("palette.json")),
+    ];
+    if let Some(p) = fixed.into_iter().flatten().find(|p| p.is_file()) {
+        return Some(p);
+    }
+    if let Some(p) = running_rice_dir().map(|d| d.join("palette.json")).filter(|p| p.is_file()) {
+        return Some(p);
+    }
+    home.map(|h| h.join("windows-rice").join("rice").join("palette.json")).filter(|p| p.is_file())
+}
+
+/// Folder of a running rice.exe, if there is one.
+fn running_rice_dir() -> Option<PathBuf> {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let mut sys = System::new().ok()?;
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing().with_exe(UpdateKind::OnlyIfNotSet));
+    sys.processes()
+        .values()
+        .filter(|p| p.name().eq_ignore_ascii_case("rice.exe"))
+        .find_map(|p| p.exe().and_then(|e| e.parent()).map(PathBuf::from))
+}
+
+/// The palette file in use; looked up again whenever it goes missing, so the
+/// theme starts following the wallpaper as soon as the rice shows up.
 fn palette_path() -> Option<PathBuf> {
-    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
-    Some(PathBuf::from(home).join(".config").join("rice").join("palette.json"))
+    use std::sync::Mutex;
+    use std::time::Instant;
+    // (file in use, when we last searched) — no rice on this PC means at most
+    // one search every 10 s, not a process scan on every 1.5 s poll
+    static FOUND: Mutex<(Option<PathBuf>, Option<Instant>)> = Mutex::new((None, None));
+    let mut found = FOUND.lock().unwrap_or_else(|e| e.into_inner());
+    let (path, searched) = &mut *found;
+    if !path.as_ref().is_some_and(|p| p.is_file()) && searched.is_none_or(|t| t.elapsed() >= Duration::from_secs(10)) {
+        *path = find_palette();
+        *searched = Some(Instant::now());
+    }
+    path.clone()
 }
 
 #[derive(Deserialize)]
@@ -195,7 +243,7 @@ struct PaletteFile {
     colors: BTreeMap<String, String>,
 }
 
-/// Colour roles from the rice palette (`~/.config/rice/palette.json`).
+/// Colour roles from the rice palette (see `find_palette` for where it is looked for).
 #[tauri::command]
 pub fn get_palette() -> Option<BTreeMap<String, String>> {
     let bytes = fs::read(palette_path()?).ok()?;
@@ -204,16 +252,21 @@ pub fn get_palette() -> Option<BTreeMap<String, String>> {
 }
 
 /// Poll the palette file and tell the UI when the wallpaper changes it.
+///
+/// Compares the parsed colours rather than the file's mtime, so it still works
+/// when Sift starts (e.g. with Windows) before the rice script has written the
+/// file, when the file is replaced by a copy that keeps an older timestamp, and
+/// when a poll lands mid-write (an unreadable file is skipped, not sent as
+/// "no palette"). The UI also re-reads the palette whenever the window is shown.
 pub fn watch_palette(app: AppHandle) {
     std::thread::spawn(move || {
-        let mut last: Option<SystemTime> = None;
+        let mut last: Option<BTreeMap<String, String>> = None;
         loop {
-            let m = palette_path().and_then(|p| fs::metadata(p).ok()).and_then(|m| m.modified().ok());
-            if m.is_some() && m != last {
-                if last.is_some() {
-                    let _ = app.emit("theme://changed", get_palette());
+            if let Some(p) = get_palette() {
+                if last.as_ref() != Some(&p) {
+                    let _ = app.emit("theme://changed", Some(&p));
+                    last = Some(p);
                 }
-                last = m;
             }
             std::thread::sleep(Duration::from_millis(1500));
         }

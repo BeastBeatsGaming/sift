@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { api, type Action, type Safety, type Suggestion } from "../api";
 import { useFeedback } from "../components/feedback";
-import { RevealButton, SafetyBadge, Empty, si } from "../components/ui";
+import { NoUndo, RevealButton, SafetyBadge, Empty, si } from "../components/ui";
 import { bytes, count } from "../format";
 
 const FILTERS: { key: "all" | Safety; label: string }[] = [
@@ -18,7 +18,7 @@ function actionLabel(a: Action): string {
     case "command":
       return `Runs ${[a.program, ...a.args].join(" ")} · can't undo`;
     case "open_settings":
-      return "Opens Windows Settings";
+      return "Opens Windows Settings · Windows deletes these for good";
     case "manual":
       return "Do it yourself — see above";
   }
@@ -58,6 +58,20 @@ export function Suggestions({ suggestions: all, onOpenDuplicates }: { suggestion
   async function run(s: Suggestion) {
     const a = s.action;
     if (a.kind === "open_settings") {
+      const ok = await fb.confirm({
+        title: "Open Windows Settings?",
+        body: (
+          <>
+            <p>
+              <NoUndo /> Windows deletes “{s.title.split(" — ")[0]}” itself, outside Sift.
+            </p>
+            <p className="muted">{s.how} Nothing goes to .sift-trash, so History can't bring it back.</p>
+          </>
+        ),
+        confirm: "Open Settings",
+        danger: true,
+      });
+      if (!ok) return;
       fb.report(await api.cleanSuggestion(s.id, null));
       return;
     }
@@ -67,9 +81,12 @@ export function Suggestions({ suggestions: all, onOpenDuplicates }: { suggestion
       title: isCmd ? `Run ${a.program}?` : `Move ${count(p.n)} item${p.n === 1 ? "" : "s"} to .sift-trash?`,
       body: isCmd ? (
         <>
+          <p>
+            <NoUndo /> Sift runs this command; it deletes directly, not into .sift-trash.
+          </p>
           <code className="cmd">{[a.program, ...a.args].join(" ")}</code>
           <p className="muted">
-            Clears about {bytes(s.bytes)}. <b className="fg">This can't be undone</b>, but the tool re-downloads whatever it needs later.
+            Clears about {bytes(s.bytes)}. History can't bring it back{s.id === "docker" ? "." : ", but the tool re-downloads whatever it needs later."}
           </p>
         </>
       ) : (
@@ -141,11 +158,14 @@ export function Suggestions({ suggestions: all, onOpenDuplicates }: { suggestion
               // with nothing ticked the button opens the item list instead of running
               const needsPick = selectable && p.n === 0;
               return (
-                <div key={s.id} className={`sugg ${isOpen ? "open" : ""}`} style={si(i)}>
+                <div key={s.id} className={`sugg ${isOpen ? "open" : ""} ${s.permanent ? "permanent" : ""}`} style={si(i)}>
                   <div className="sugg-head" onClick={() => setOpen(isOpen ? null : s.id)}>
                     <span className="chev">▸</span>
                     <span className="sugg-title">
-                      <b>{s.title}</b>
+                      <span className="sugg-title-line">
+                        <b>{s.title}</b>
+                        {s.permanent && <NoUndo />}
+                      </span>
                       <span className="sugg-how">{s.how}</span>
                     </span>
                     <SafetyBadge safety={s.safety} />
@@ -157,7 +177,8 @@ export function Suggestions({ suggestions: all, onOpenDuplicates }: { suggestion
                         </button>
                       ) : s.action.kind === "manual" ? null : (
                         <button
-                          className={`btn ${needsPick ? "btn-ghost" : s.safety === "Safe" ? "btn-ok" : ""}`}
+                          className={`btn ${needsPick ? "btn-ghost" : s.permanent ? "btn-permanent" : s.safety === "Safe" ? "btn-ok" : ""}`}
+                          title={s.permanent ? "Can't be undone" : undefined}
                           disabled={busy === s.id || (needsPick && isOpen)}
                           onClick={() => (needsPick ? setOpen(s.id) : run(s))}
                         >
@@ -178,7 +199,7 @@ export function Suggestions({ suggestions: all, onOpenDuplicates }: { suggestion
                   </div>
                   {isOpen && (
                     <>
-                      <div className="sugg-meta">{actionLabel(s.action).toUpperCase()}</div>
+                      <div className={`sugg-meta ${s.permanent ? "danger-text" : ""}`}>{actionLabel(s.action).toUpperCase()}</div>
                       <div className="items">
                         {selectable && s.items.length > 0 && (
                           <label className="select-all">

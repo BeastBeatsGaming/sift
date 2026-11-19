@@ -18,6 +18,8 @@ export interface Suggestion {
   safety: Safety;
   how: string;
   action: Action;
+  /** Can't be undone from Sift (command, Windows Settings, emptying a bin). */
+  permanent: boolean;
   items: Located[];
   item_count: number;
 }
@@ -28,6 +30,8 @@ export interface ScanStats { files: number; dirs: number; errors: number; cloud_
 
 export interface Summary {
   root_path: string;
+  /** Unix seconds; an old value means the saved last scan was loaded. */
+  scanned_at: number;
   total: number;
   stats: ScanStats;
   categories: [string, number][];
@@ -125,6 +129,10 @@ export interface BackgroundStatus {
 
 export type Palette = Record<string, string>;
 
+export interface AppInfo { version: string; os: string; repo: string; log_path: string | null }
+
+export interface SearchHit { path: string; size: number; is_dir: boolean; index_path: number[] | null }
+
 export const api = {
   listDrives: () => invoke<Drive[]>("list_drives"),
   startScan: (path: string) => invoke<void>("start_scan", { path }),
@@ -150,6 +158,11 @@ export const api = {
   backgroundStatus: () => invoke<BackgroundStatus>("get_background_status"),
   runBackgroundScan: () => invoke<void>("run_background_scan_now"),
   palette: () => invoke<Palette | null>("get_palette"),
+  search: (query: string, limit = 200) => invoke<SearchHit[]>("search", { query, limit }),
+  appInfo: () => invoke<AppInfo>("get_app_info"),
+  diagnostics: () => invoke<string>("get_diagnostics"),
+  logUi: (level: "warn" | "error", message: string) => invoke<void>("log_ui", { level, message }),
+  openUrl: (url: string) => invoke<void>("open_url", { url }),
 };
 
 export function onThemeChanged(h: (p: Palette | null) => void): Promise<UnlistenFn> {

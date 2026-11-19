@@ -21,6 +21,8 @@ pub enum Context {
     Unity,
     /// Parent has a `*.uproject` file.
     Unreal,
+    /// Parent has a `Cargo.toml` file.
+    Cargo,
 }
 
 pub const REGEN_RULES: &[RegenRule] = &[
@@ -33,6 +35,7 @@ pub const REGEN_RULES: &[RegenRule] = &[
     RegenRule { id: "pytest_cache", dir_name: ".pytest_cache", context: Context::Any, label: "pytest cache", how: "Regenerated on the next test run.", safety: Safety::Safe },
     RegenRule { id: "venv", dir_name: ".venv", context: Context::Any, label: "Python virtualenv", how: "Recreate with `pip install -r requirements.txt`.", safety: Safety::Review },
     RegenRule { id: "venv2", dir_name: "venv", context: Context::Any, label: "Python virtualenv (probably)", how: "Check it holds pyvenv.cfg; recreate with pip.", safety: Safety::Review },
+    RegenRule { id: "cargo_target", dir_name: "target", context: Context::Cargo, label: "Rust build output (target/)", how: "Rebuilt by the next `cargo build` (a full rebuild takes a while). Same as `cargo clean`.", safety: Safety::Safe },
     RegenRule { id: "gradle_project", dir_name: ".gradle", context: Context::Any, label: "Gradle project cache", how: "Rebuilt on the next build.", safety: Safety::Safe },
     RegenRule { id: "unity_library", dir_name: "Library", context: Context::Unity, label: "Unity Library (import cache)", how: "Close Unity first. Reimports on next open (slow for big projects).", safety: Safety::Review },
     RegenRule { id: "unity_temp", dir_name: "Temp", context: Context::Unity, label: "Unity Temp", how: "Close Unity first.", safety: Safety::Safe },
@@ -119,10 +122,13 @@ pub const KNOWN_LOCATIONS: &[KnownLocation] = &[
     KnownLocation { id: "pnpm_store", label: "pnpm store", paths: &["%LOCALAPPDATA%\\pnpm\\store", "%LOCALAPPDATA%\\pnpm-store"], safety: Safety::Safe, how: "Runs `pnpm store prune`.", action: KnownAction::Command("pnpm", &["store", "prune"]) },
     KnownLocation { id: "pip_cache", label: "pip cache", paths: &["%LOCALAPPDATA%\\pip\\Cache"], safety: Safety::Safe, how: "Runs `pip cache purge`.", action: KnownAction::Command("pip", &["cache", "purge"]) },
     KnownLocation { id: "nuget", label: "NuGet packages", paths: &["%USERPROFILE%\\.nuget\\packages"], safety: Safety::Safe, how: "Runs `dotnet nuget locals all --clear`.", action: KnownAction::Command("dotnet", &["nuget", "locals", "all", "--clear"]) },
+    KnownLocation { id: "cargo_registry", label: "Cargo download cache", paths: &["%USERPROFILE%\\.cargo\\registry\\cache", "%USERPROFILE%\\.cargo\\git\\db"], safety: Safety::Safe, how: "Downloaded crate archives; Cargo fetches them again when a build needs them.", action: KnownAction::Quarantine },
+    KnownLocation { id: "steam_shaders", label: "Steam shader cache", paths: &["%ProgramFiles(x86)%\\Steam\\steamapps\\shadercache"], safety: Safety::Safe, how: "Close Steam first. Rebuilt per game; first launches stutter briefly.", action: KnownAction::Quarantine },
+    KnownLocation { id: "jetbrains_caches", label: "JetBrains IDE caches", paths: &["%LOCALAPPDATA%\\JetBrains\\*\\caches", "%LOCALAPPDATA%\\JetBrains\\*\\index"], safety: Safety::Safe, how: "Close the IDE first. Re-indexes projects on next open.", action: KnownAction::Quarantine },
     KnownLocation { id: "gradle_caches", label: "Gradle caches", paths: &["%USERPROFILE%\\.gradle\\caches"], safety: Safety::Safe, how: "Redownloaded on the next Android/Gradle build.", action: KnownAction::Quarantine },
     KnownLocation { id: "unity_cache", label: "Unity global cache", paths: &["%LOCALAPPDATA%\\Unity\\cache", "%LOCALAPPDATA%\\Unity\\Caches"], safety: Safety::Safe, how: "Close Unity first; packages redownload when needed.", action: KnownAction::Quarantine },
     KnownLocation { id: "unity_asset_store", label: "Unity Asset Store downloads", paths: &["%APPDATA%\\Unity\\Asset Store-5.x"], safety: Safety::Review, how: "Downloaded .unitypackage files; redownloadable from Package Manager → My Assets.", action: KnownAction::Quarantine },
-    KnownLocation { id: "docker", label: "Docker data", paths: &["%LOCALAPPDATA%\\Docker\\wsl"], safety: Safety::TradeOff, how: "Runs `docker system prune -a --volumes` (removes unused images and volumes). The disk file shrinks only after compacting.", action: KnownAction::Command("docker", &["system", "prune", "-a", "--volumes", "-f"]) },
+    KnownLocation { id: "docker", label: "Docker data", paths: &["%LOCALAPPDATA%\\Docker\\wsl"], safety: Safety::TradeOff, how: "Runs `docker system prune -a` (removes stopped containers, unused images, networks and build cache; volumes are kept). Start Docker Desktop first. The disk file shrinks only after compacting.", action: KnownAction::Command("docker", &["system", "prune", "-a", "-f"]) },
     KnownLocation { id: "wsl_disks", label: "WSL distro disks", paths: &["%LOCALAPPDATA%\\Packages\\*\\LocalState\\ext4.vhdx", "%LOCALAPPDATA%\\wsl\\*\\ext4.vhdx"], safety: Safety::TradeOff, how: "Clean inside the distro, then `wsl --shutdown` and compact with diskpart → select vdisk file=\"<path>\" → compact vdisk.", action: KnownAction::Manual },
     KnownLocation { id: "hiberfil", label: "Hibernation file", paths: &["%SystemDrive%\\hiberfil.sys"], safety: Safety::TradeOff, how: "`powercfg /h off` frees it but disables hibernate and Fast Startup; `powercfg /h /type reduced` shrinks it and keeps Fast Startup. Needs admin.", action: KnownAction::Manual },
     KnownLocation { id: "pagefile", label: "Page file", paths: &["%SystemDrive%\\pagefile.sys"], safety: Safety::Leave, how: "Managed by Windows. Leave it.", action: KnownAction::Manual },

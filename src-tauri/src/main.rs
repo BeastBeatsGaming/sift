@@ -6,6 +6,7 @@ use tauri::Manager;
 mod background;
 mod cleanup;
 mod commands;
+mod diag;
 mod settings;
 
 /// Passed to the elevated copy started by "Run as admin".
@@ -40,12 +41,14 @@ fn main() {
         ))
         .manage(commands::AppState::default())
         .setup(move |app| {
+            diag::init(app);
             let s = settings::load(app);
             let days = s.auto_purge_days;
             *app.state::<commands::AppState>().settings.lock().unwrap() = s;
             cleanup::init(app, days)?;
             settings::watch_palette(app.handle().clone());
             background::init(app);
+            commands::restore_last(app.handle());
             // the window starts hidden; started with Windows it stays that way
             if !background {
                 if let Some(w) = app.get_webview_window("main") {
@@ -64,6 +67,11 @@ fn main() {
             commands::get_big_files,
             commands::get_duplicates,
             commands::reveal,
+            commands::search,
+            diag::get_app_info,
+            diag::get_diagnostics,
+            diag::log_ui,
+            diag::open_url,
             cleanup::clean_suggestion,
             cleanup::quarantine_paths,
             cleanup::clean_duplicates,

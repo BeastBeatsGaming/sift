@@ -206,7 +206,9 @@ pub fn run(app: &AppHandle, manual: bool) {
     }
     if stored {
         let _ = app.emit("scan://done", ());
+        crate::commands::persist(app);
     }
+    crate::diag::info(format!("background scan · {root_s} · {} safe · notify={over}", human(safe)));
 
     save_status(&Status { last_run: now(), last_root: root_s.clone(), last_safe: safe, last_notified: over });
     if let Some(t) = app.tray_by_id(TRAY_ID) {

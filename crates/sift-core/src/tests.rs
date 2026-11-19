@@ -289,3 +289,47 @@ fn full_check_rejects_sample_lookalikes() {
     assert_eq!(differ[0].0, c);
     assert!(dupes::verify_copies(&t.path().join("missing"), &[a]).is_err());
 }
+
+#[test]
+fn snapshot_round_trips() {
+    let t = fixture();
+    let (so, sg) = small_opts();
+    let scan = scan(t.path(), &so, &Progress::default());
+    let report = suggest(&scan, &sg);
+    let file = t.path().join("state/last-scan.json");
+    crate::snapshot::save(&file, &scan, &report).unwrap();
+    let (s2, r2) = crate::snapshot::load(&file).expect("loads");
+    assert_eq!(s2.root.size, scan.root.size);
+    assert_eq!(s2.scanned_at, scan.scanned_at);
+    assert_eq!(s2.big_files.len(), scan.big_files.len());
+    assert_eq!(s2.special.len(), scan.special.len());
+    assert_eq!(r2.suggestions.len(), report.suggestions.len());
+    // rule ids survive the trip, so regenerable folders are still found
+    let unity = s2.root.children.iter().find(|c| c.name == "game").unwrap();
+    assert!(unity.children.iter().any(|c| c.regen_rule == Some("unity_library")));
+    assert!(crate::snapshot::load(&t.path().join("missing.json")).is_none());
+}
+
+#[test]
+fn cargo_target_needs_a_manifest() {
+    let t = tempfile::tempdir().unwrap();
+    let r = t.path();
+    write(&r.join("crate/Cargo.toml"), 10, 1);
+    write(&r.join("crate/target/debug/big.rlib"), 5000, 2);
+    write(&r.join("site/target/keep.txt"), 5000, 3); // no Cargo.toml: keep
+    let (so, sg) = small_opts();
+    let report = suggest(&scan(r, &so, &Progress::default()), &sg);
+    let s = report.suggestions.iter().find(|s| s.id == "regen:cargo_target").expect("flagged");
+    assert_eq!(s.items.len(), 1);
+    assert!(s.items[0].path.ends_with("crate/target"));
+}
+
+#[test]
+fn only_trash_moves_are_undoable() {
+    use crate::suggest::is_permanent;
+    assert!(!is_permanent("x", &Action::Quarantine { contents: true }));
+    assert!(is_permanent("npm_cache", &Action::Command { program: "npm".into(), args: vec![] }));
+    assert!(is_permanent("windows_old", &Action::OpenSettings { uri: "ms-settings:storagepolicies".into() }));
+    assert!(is_permanent("recycle_bin", &Action::Manual));
+    assert!(!is_permanent("hiberfil", &Action::Manual));
+}

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { api, type BackgroundStatus, type Settings } from "../api";
+import { api, type AppInfo, type BackgroundStatus, type Settings } from "../api";
+import { bugReportUrl, copyText, REPO, type Release } from "../meta";
 import { bytes } from "../format";
 import { useFeedback } from "../components/feedback";
 import { Empty } from "../components/ui";
@@ -34,7 +35,109 @@ function Toggle({ label, hint, value, onChange }: { label: string; hint?: string
   );
 }
 
-export function SettingsView({ settings, onSaved, hasPalette }: { settings: Settings; onSaved: (s: Settings) => void; hasPalette: boolean }) {
+const SHORTCUTS: [string, string][] = [
+  ["Ctrl+R", "Rescan"],
+  ["Ctrl+F", "Search"],
+  ["Ctrl+1…6", "Switch tab"],
+  ["Ctrl+,", "Settings"],
+  ["Esc", "Close"],
+  ["Right-click", "File / folder actions"],
+];
+
+function About({ info, update, onCheckUpdate }: { info: AppInfo | null; update: Release | null; onCheckUpdate: () => void }) {
+  const fb = useFeedback();
+  const open = (url: string) => api.openUrl(url).catch((e) => fb.toast({ text: String(e), tone: "warn" }));
+  return (
+    <section>
+      <h3>About</h3>
+      <div className="card about">
+        <div className="about-block about-top">
+          <div className="about-id">
+            <span className="about-name">
+              Sift <span className="mono">{info?.version ?? ""}</span>
+            </span>
+            {update ? <span className="about-pill pill-update">v{update.version} available</span> : <span className="about-pill">Up to date</span>}
+          </div>
+          {update ? (
+            <button className="btn btn-sm" onClick={() => open(update.url)}>
+              Get v{update.version}
+            </button>
+          ) : (
+            <button className="btn btn-ghost btn-sm" onClick={onCheckUpdate}>
+              Check for updates
+            </button>
+          )}
+          <div className="about-meta muted small">
+            <span>{info?.os ?? "Windows"}</span>
+            <span>MIT license</span>
+            <button className="link" onClick={() => open(REPO)}>
+              GitHub ↗
+            </button>
+            <button className="link" onClick={() => open(`${REPO}/releases`)}>
+              Releases ↗
+            </button>
+          </div>
+        </div>
+
+        <div className="about-block">
+          <div className="label">Report a problem</div>
+          <p className="muted small">Opens a GitHub issue with your version filled in. Copy diagnostics first and paste them in — they hold the end of Sift's log, never file contents.</p>
+          <div className="about-actions">
+            <button className="btn btn-sm" onClick={() => open(bugReportUrl(info))}>
+              Report a bug
+            </button>
+            <button
+              className="btn btn-ghost btn-sm"
+              onClick={async () => {
+                try {
+                  await copyText(await api.diagnostics());
+                  fb.toast({ text: "Diagnostics copied", detail: ["Paste them into the bug report"] });
+                } catch (e) {
+                  fb.toast({ text: String(e), tone: "warn" });
+                }
+              }}
+            >
+              Copy diagnostics
+            </button>
+            {info?.log_path && (
+              <button className="btn btn-ghost btn-sm" onClick={() => api.reveal(info.log_path!).catch((e) => fb.toast({ text: String(e), tone: "warn" }))}>
+                Show log file
+              </button>
+            )}
+          </div>
+        </div>
+
+        <div className="about-block">
+          <div className="label">Keyboard shortcuts</div>
+          <div className="shortcuts">
+            {SHORTCUTS.map(([k, what]) => (
+              <div key={k} className="shortcut">
+                <span className="kbd">{k}</span>
+                <span className="muted small">{what}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
+
+export function SettingsView({
+  settings,
+  onSaved,
+  hasPalette,
+  info,
+  update,
+  onCheckUpdate,
+}: {
+  settings: Settings;
+  onSaved: (s: Settings) => void;
+  hasPalette: boolean;
+  info: AppInfo | null;
+  update: Release | null;
+  onCheckUpdate: () => void;
+}) {
   const fb = useFeedback();
   const [s, setS] = useState(settings);
   useEffect(() => setS(settings), [settings]);
@@ -68,7 +171,7 @@ export function SettingsView({ settings, onSaved, hasPalette }: { settings: Sett
         <div className="card fields">
           <Toggle
             label="Match my rice palette"
-            hint={hasPalette ? "Colours from ~/.config/rice/palette.json, updated live when the wallpaper changes" : "No ~/.config/rice/palette.json found — using Sift's default colours"}
+            hint={hasPalette ? "Colours from your rice's palette.json, updated live when the wallpaper changes" : "No rice palette found — using Sift's default colours"}
             value={s.rice_theme}
             onChange={(v) => set("rice_theme", v)}
           />
@@ -166,6 +269,8 @@ export function SettingsView({ settings, onSaved, hasPalette }: { settings: Sett
           ))}
         </div>
       </section>
+
+      <About info={info} update={update} onCheckUpdate={onCheckUpdate} />
 
       <div className="settings-actions">
         <button className="btn btn-ghost" disabled={!dirty} onClick={() => setS(settings)}>

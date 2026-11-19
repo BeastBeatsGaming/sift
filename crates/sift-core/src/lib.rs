@@ -13,6 +13,7 @@ pub mod model;
 pub mod protect;
 pub mod rules;
 pub mod scan;
+pub mod snapshot;
 pub mod suggest;
 pub mod trash;
 pub mod update;

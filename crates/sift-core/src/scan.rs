@@ -111,6 +111,7 @@ pub fn scan(root: &Path, opts: &ScanOptions, progress: &Progress) -> ScanResult 
 
     ScanResult {
         root_path: root.to_path_buf(),
+        scanned_at: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0),
         stats: ScanStats {
             files: progress.files.load(Relaxed),
             dirs: progress.dirs.load(Relaxed),
@@ -150,6 +151,7 @@ fn scan_dir(ctx: &Ctx, path: &Path, name: String, regen_rule: Option<&'static st
     let mut bigs = Vec::new();
     let mut specials: Vec<(&'static str, FileEntry)> = Vec::new();
     let mut is_unreal = false;
+    let mut is_cargo = false;
 
     for entry in rd {
         let Ok(entry) = entry else {
@@ -179,6 +181,7 @@ fn scan_dir(ctx: &Ctx, path: &Path, name: String, regen_rule: Option<&'static st
             node.file_count += 1;
             let ext = ext_of(&fname);
             is_unreal |= ext == "uproject";
+            is_cargo |= fname == "Cargo.toml";
             *cats.entry(rules::category(&ext)).or_default() += size;
             let special = rules::special_for_ext(&ext);
             if size >= ctx.opts.big_file_min || special.is_some() {
@@ -226,6 +229,7 @@ fn scan_dir(ctx: &Ctx, path: &Path, name: String, regen_rule: Option<&'static st
                                 Context::Any => true,
                                 Context::Unity => is_unity,
                                 Context::Unreal => is_unreal,
+                                Context::Cargo => is_cargo,
                             }
                     })
                     .map(|r| r.id)

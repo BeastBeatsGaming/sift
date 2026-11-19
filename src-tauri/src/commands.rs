@@ -108,6 +108,7 @@ pub fn start_scan(app: AppHandle, state: State<'_, AppState>, path: String) -> R
         p
     };
 
+    crate::diag::info(format!("scan start · {path}"));
     thread::spawn(move || {
         let done = Arc::new(AtomicBool::new(false));
         let ticker = {
@@ -128,20 +129,98 @@ pub fn start_scan(app: AppHandle, state: State<'_, AppState>, path: String) -> R
         if progress.is_cancelled() {
             *state.running.lock().unwrap() = None;
             let _ = app.emit("scan://cancelled", ());
+            crate::diag::info("scan cancelled");
             return;
         }
 
         let _ = app.emit("scan://progress", snapshot(&progress, "analyzing"));
         let report = suggest(&scan, &crate::settings::current(&app).suggest_options());
         let disk = disk_for(&root);
+        let st = &scan.stats;
+        crate::diag::info(format!(
+            "scan done · {} · {} files, {} folders, {} errors · {} ms · {} suggestions",
+            root.display(),
+            st.files,
+            st.dirs,
+            st.errors,
+            st.elapsed_ms,
+            report.suggestions.len()
+        ));
         *state.data.write().unwrap() = Some(Loaded { scan, report, disk });
         *state.running.lock().unwrap() = None;
         let _ = app.emit("scan://done", ());
+        persist(&app);
     });
     Ok(())
 }
 
 use tauri::Manager;
+
+// ------------------------------------------------------------- last scan
+
+fn snapshot_path(app: &AppHandle) -> Option<PathBuf> {
+    app.path().app_local_data_dir().ok().map(|d| d.join("last-scan.json"))
+}
+
+static SAVING: AtomicBool = AtomicBool::new(false);
+static SAVE_AGAIN: AtomicBool = AtomicBool::new(false);
+
+/// Save the loaded scan in the background (after a scan and after every
+/// change), so the next launch opens straight to it. Calls that arrive while
+/// a save is running are folded into one more save.
+pub fn persist(app: &AppHandle) {
+    if SAVING.swap(true, Relaxed) {
+        SAVE_AGAIN.store(true, Relaxed);
+        return;
+    }
+    let app = app.clone();
+    thread::spawn(move || {
+        loop {
+            SAVE_AGAIN.store(false, Relaxed);
+            if let Some(path) = snapshot_path(&app) {
+                let state = app.state::<AppState>();
+                let g = state.data.read().unwrap();
+                if let Some(l) = g.as_ref() {
+                    if let Err(e) = sift_core::snapshot::save(&path, &l.scan, &l.report) {
+                        crate::diag::warn(format!("couldn't save last scan · {e}"));
+                    }
+                }
+            }
+            if !SAVE_AGAIN.load(Relaxed) {
+                break;
+            }
+        }
+        SAVING.store(false, Relaxed);
+    });
+}
+
+/// Load the saved scan on start, unless a scan has already started or
+/// something else (a background scan) got there first.
+pub fn restore_last(app: &AppHandle) {
+    let app = app.clone();
+    thread::spawn(move || {
+        let Some(path) = snapshot_path(&app) else { return };
+        let started = std::time::Instant::now();
+        let Some((scan, report)) = sift_core::snapshot::load(&path) else { return };
+        if !scan.root_path.is_dir() {
+            return;
+        }
+        let state = app.state::<AppState>();
+        if state.running.lock().unwrap().is_some() {
+            return;
+        }
+        {
+            let mut g = state.data.write().unwrap();
+            if g.is_some() {
+                return;
+            }
+            let disk = disk_for(&scan.root_path);
+            crate::diag::info(format!("restored last scan · {} · {} ms", scan.root_path.display(), started.elapsed().as_millis()));
+            *g = Some(Loaded { scan, report, disk });
+        }
+        let _ = app.emit("scan://done", ());
+    });
+}
 
 #[tauri::command]
 pub fn cancel_scan(state: State<'_, AppState>) {
@@ -155,6 +234,8 @@ pub fn cancel_scan(state: State<'_, AppState>) {
 #[derive(Serialize)]
 pub struct Summary {
     root_path: PathBuf,
+    /// Unix seconds; older results come from the saved last scan.
+    scanned_at: i64,
     total: u64,
     stats: ScanStats,
     categories: Vec<(String, u64)>,
@@ -169,6 +250,7 @@ pub fn get_summary(state: State<'_, AppState>) -> Result<Summary, String> {
     let l = g.as_ref().ok_or("No scan yet")?;
     Ok(Summary {
         root_path: l.scan.root_path.clone(),
+        scanned_at: l.scan.scanned_at,
         total: l.scan.root.size,
         stats: l.scan.stats.clone(),
         categories: l.scan.categories.clone(),
@@ -290,4 +372,51 @@ pub fn reveal(path: String) -> Result<(), String> {
     #[cfg(all(unix, not(target_os = "macos")))]
     let r = std::process::Command::new("xdg-open").arg(p.parent().unwrap_or(p)).spawn();
     r.map(|_| ()).map_err(|e| e.to_string())
+}
+
+// ------------------------------------------------------------------ search
+
+#[derive(Serialize)]
+pub struct SearchHit {
+    path: PathBuf,
+    size: u64,
+    is_dir: bool,
+    /// For folders: child indices for `get_dir`.
+    index_path: Option<Vec<u32>>,
+}
+
+fn search_dirs(node: &DirNode, path: &mut PathBuf, idx: &mut Vec<u32>, q: &str, out: &mut Vec<SearchHit>) {
+    for (i, c) in node.children.iter().enumerate() {
+        path.push(&c.name);
+        idx.push(i as u32);
+        if c.name.to_lowercase().contains(q) {
+            out.push(SearchHit { path: path.clone(), size: c.size, is_dir: true, index_path: Some(idx.clone()) });
+        }
+        search_dirs(c, path, idx, q, out);
+        idx.pop();
+        path.pop();
+    }
+}
+
+/// Folders anywhere in the scan, and large files, whose name contains `query`.
+/// Largest first. Small files aren't kept per file, so they can't be found.
+#[tauri::command]
+pub fn search(state: State<'_, AppState>, query: String, limit: usize) -> Result<Vec<SearchHit>, String> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return Ok(Vec::new());
+    }
+    let g = state.data.read().unwrap();
+    let l = g.as_ref().ok_or("No scan yet")?;
+    let mut out = Vec::new();
+    search_dirs(&l.scan.root, &mut l.scan.root_path.clone(), &mut Vec::new(), &q, &mut out);
+    for f in &l.scan.big_files {
+        let name = f.path.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+        if name.contains(&q) {
+            out.push(SearchHit { path: f.path.clone(), size: f.size, is_dir: false, index_path: None });
+        }
+    }
+    out.sort_unstable_by(|a, b| b.size.cmp(&a.size));
+    out.truncate(limit.min(500));
+    Ok(out)
 }
