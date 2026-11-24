@@ -56,6 +56,11 @@ fn disks() -> Vec<DriveInfo> {
     out
 }
 
+/// Mount points of every drive, for finding the `.sift-trash` folders.
+pub fn drive_roots() -> Vec<PathBuf> {
+    disks().into_iter().map(|d| PathBuf::from(d.path)).collect()
+}
+
 #[tauri::command]
 pub fn list_drives() -> Vec<DriveInfo> {
     disks()

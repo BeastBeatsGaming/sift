@@ -72,6 +72,19 @@ export function History({ version }: { version: number }) {
 
   return (
     <div className="page">
+      {h.notice && (
+        <div className="notice notice-alert notice-row">
+          <span style={{ flex: 1 }}>{h.notice}</span>
+          <button
+            className="btn btn-ghost btn-sm"
+            onClick={() => {
+              api.dismissHistoryNotice().then(() => setH({ ...h, notice: null })).catch((e) => fb.toast({ text: String(e), tone: "alert" }));
+            }}
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
       <section className="card hist-summary">
         <div className="hist-readouts">
           <div className="readout">

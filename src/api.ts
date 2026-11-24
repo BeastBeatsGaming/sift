@@ -79,7 +79,7 @@ export interface CleanResult {
   output: string | null;
 }
 
-export type EntryState = "in_trash" | "restored" | "purged";
+export type EntryState = "pending" | "in_trash" | "restored" | "purged";
 
 export interface BatchView {
   id: string;
@@ -99,7 +99,14 @@ export interface BatchView {
   output: string | null;
 }
 
-export interface HistoryView { in_trash: number; auto_purge_days: number; batches: BatchView[]; freed: { created: number; freed: number }[] }
+export interface HistoryView {
+  in_trash: number;
+  auto_purge_days: number;
+  batches: BatchView[];
+  freed: { created: number; freed: number }[];
+  /** A repaired history or a settled interrupted cleanup; shown until dismissed. */
+  notice: string | null;
+}
 
 export interface Settings {
   auto_purge_days: number;
@@ -145,8 +152,11 @@ export const api = {
   reveal: (path: string) => invoke<void>("reveal", { path }),
   cleanSuggestion: (id: string, paths: string[] | null) => invoke<CleanResult>("clean_suggestion", { id, paths }),
   cleanDuplicates: (picks: { keep: string; remove: string[] }[]) => invoke<CleanResult>("clean_duplicates", { picks }),
-  quarantinePaths: (paths: string[], label: string) => invoke<CleanResult>("quarantine_paths", { paths, label }),
+  quarantinePaths: (paths: string[], label: string, allowSynced = false) => invoke<CleanResult>("quarantine_paths", { paths, label, allowSynced }),
+  /** Which of these paths OneDrive syncs (moving them deletes them from the cloud too). */
+  syncedAmong: (paths: string[]) => invoke<string[]>("synced_among", { paths }),
   history: () => invoke<HistoryView>("get_history"),
+  dismissHistoryNotice: () => invoke<void>("dismiss_history_notice"),
   restoreBatch: (id: string) => invoke<CleanResult>("restore_batch", { id }),
   purgeBatch: (id: string) => invoke<CleanResult>("purge_batch", { id }),
   emptyTrash: () => invoke<CleanResult>("empty_trash"),

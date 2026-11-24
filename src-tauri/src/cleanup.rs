@@ -30,6 +30,30 @@ impl CleanResult {
     }
 }
 
+/// Scan-derived suggestions never touch installed software, and the
+/// archive-like ones never touch files OneDrive syncs. The report is built with
+/// the same rules, but it can be older than the rules (a restored last scan), so
+/// the move re-checks.
+fn guard_targets(app: &AppHandle, id: &str, targets: Vec<(PathBuf, u64)>) -> (Vec<(PathBuf, u64)>, Vec<Skip>) {
+    if !suggest::is_scan_derived(id) {
+        return (targets, Vec::new());
+    }
+    let guards = suggest::Guards::new(&crate::settings::current(app).suggest_options());
+    let archive = suggest::is_archive_like(id);
+    let mut ok = Vec::new();
+    let mut skipped = Vec::new();
+    for (p, b) in targets {
+        if let Some(reason) = guards.software(&p) {
+            skipped.push(Skip { path: p, reason: reason.into() });
+        } else if archive && guards.synced(&p) {
+            skipped.push(Skip { path: p, reason: protect::SYNCED_REASON.into() });
+        } else {
+            ok.push((p, b));
+        }
+    }
+    (ok, skipped)
+}
+
 fn label_of(title: &str) -> String {
     title.split(" — ").next().unwrap_or(title).to_string()
 }
@@ -103,10 +127,15 @@ pub async fn clean_suggestion(app: AppHandle, id: String, paths: Option<Vec<Stri
                     .filter(|it| paths.as_ref().is_none_or(|sel| sel.iter().any(|p| PathBuf::from(p) == it.path)))
                     .map(|it| (it.path.clone(), it.bytes))
                     .collect();
+                let (targets, blocked) = guard_targets(&app, &id, targets);
                 if targets.is_empty() {
-                    return Err("Nothing selected".into());
+                    if blocked.is_empty() {
+                        return Err("Nothing selected".into());
+                    }
+                    return Ok(CleanResult::from_outcome("quarantine", Outcome { skipped: blocked, ..Default::default() }));
                 }
-                let out = with_trash(&app, |t| t.quarantine(&label, &targets, *contents))?;
+                let mut out = with_trash(&app, |t| t.quarantine(&label, &targets, *contents))?;
+                out.skipped.extend(blocked);
                 let remeasure: Vec<&str> = if *contents { vec![id.as_str()] } else { vec![] };
                 forget(&app, &out.moved, &remeasure);
                 changed(&app);
@@ -139,8 +168,16 @@ pub async fn clean_suggestion(app: AppHandle, id: String, paths: Option<Vec<Stri
 
 /// Move arbitrary paths (from Explorer, Large files, Duplicates) to the trash.
 #[tauri::command]
-pub async fn quarantine_paths(app: AppHandle, paths: Vec<String>, label: String) -> Result<CleanResult, String> {
+pub async fn quarantine_paths(app: AppHandle, paths: Vec<String>, label: String, allow_synced: Option<bool>) -> Result<CleanResult, String> {
     let r = tauri::async_runtime::spawn_blocking(move || {
+        // Files OneDrive syncs go with a deletion: leave them unless the user was told and agreed.
+        let (paths, held_back): (Vec<String>, Vec<String>) = if allow_synced == Some(true) {
+            (paths, Vec::new())
+        } else {
+            let roots = protect::onedrive_roots();
+            paths.into_iter().partition(|p| !protect::in_synced(std::path::Path::new(p), &roots))
+        };
+        let held: Vec<Skip> = held_back.into_iter().map(|p| Skip { path: PathBuf::from(p), reason: protect::SYNCED_REASON.into() }).collect();
         let targets: Vec<(PathBuf, u64)> = {
             let state = app.state::<AppState>();
             let g = state.data.read().unwrap();
@@ -156,7 +193,8 @@ pub async fn quarantine_paths(app: AppHandle, paths: Vec<String>, label: String)
                 })
                 .collect()
         };
-        let out = with_trash(&app, |t| t.quarantine(&label, &targets, false))?;
+        let mut out = if targets.is_empty() { Outcome::default() } else { with_trash(&app, |t| t.quarantine(&label, &targets, false))? };
+        out.skipped.extend(held);
         forget(&app, &out.moved, &[]);
         changed(&app);
         Ok(CleanResult::from_outcome("quarantine", out))
@@ -164,6 +202,14 @@ pub async fn quarantine_paths(app: AppHandle, paths: Vec<String>, label: String)
     .await
     .map_err(|e| e.to_string())?;
     crate::diag::note("quarantine_paths", r)
+}
+
+/// Which of `paths` sit in a OneDrive folder, so the UI can warn that moving
+/// them deletes them from the cloud too.
+#[tauri::command]
+pub fn synced_among(paths: Vec<String>) -> Vec<String> {
+    let roots = protect::onedrive_roots();
+    paths.into_iter().filter(|p| protect::in_synced(std::path::Path::new(p), &roots)).collect()
 }
 
 #[derive(Deserialize)]
@@ -213,6 +259,8 @@ fn quarantine_duplicates(app: &AppHandle, picks: Vec<(PathBuf, Vec<PathBuf>)>) -
         }
         rejected.extend(differ.into_iter().map(|(path, why)| Skip { path, reason: why.to_string() }));
     }
+    let (targets, blocked) = guard_targets(app, "duplicates", targets);
+    rejected.extend(blocked);
     if targets.is_empty() {
         if rejected.is_empty() {
             return Err("Nothing selected".into());
@@ -271,6 +319,9 @@ pub struct HistoryView {
     batches: Vec<BatchView>,
     /// Every cleanup ever (not capped like `batches`), for the freed totals.
     freed: Vec<FreedPoint>,
+    /// Something to tell the user: a damaged history that was repaired, an
+    /// interrupted cleanup that was settled.
+    notice: Option<String>,
 }
 
 fn freed_by(b: &Batch) -> u64 {
@@ -325,7 +376,13 @@ pub fn get_history(app: AppHandle) -> Result<HistoryView, String> {
         auto_purge_days,
         batches: t.history().batches.iter().rev().take(200).map(view).collect(),
         freed: t.history().batches.iter().map(|b| FreedPoint { created: b.created, freed: freed_by(b) }).filter(|p| p.freed > 0).collect(),
+        notice: t.notice().map(str::to_owned),
     })
+}
+
+#[tauri::command]
+pub fn dismiss_history_notice(app: AppHandle) -> Result<(), String> {
+    with_trash(&app, |t| t.dismiss_notice())
 }
 
 #[tauri::command]
@@ -381,6 +438,14 @@ pub fn init(app: &tauri::App, auto_purge_days: i64) -> Result<(), Box<dyn std::e
     let data = app.path().app_data_dir()?;
     let local = app.path().app_local_data_dir()?;
     let mut trash = Trash::open(data.join("history.json"), local.join("trash"));
+    // A lost or damaged history is rebuilt from the manifests inside each drive's .sift-trash.
+    if trash.needs_recovery() {
+        let n = trash.recover_from_manifests(&crate::commands::drive_roots());
+        crate::diag::warn(format!("history was damaged or missing; {n} batch(es) rebuilt from trash manifests"));
+    }
+    if let Some(n) = trash.notice() {
+        crate::diag::warn(format!("history: {n}"));
+    }
     if auto_purge_days > 0 {
         trash.purge_older_than(auto_purge_days);
     }

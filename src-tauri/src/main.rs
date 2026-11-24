@@ -76,6 +76,8 @@ fn main() {
             cleanup::quarantine_paths,
             cleanup::clean_duplicates,
             cleanup::get_history,
+            cleanup::dismiss_history_notice,
+            cleanup::synced_among,
             cleanup::restore_batch,
             cleanup::purge_batch,
             cleanup::empty_trash,

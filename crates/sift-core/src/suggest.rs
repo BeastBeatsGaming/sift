@@ -1,5 +1,6 @@
 use crate::dupes::find_duplicates;
 use crate::model::*;
+use crate::protect;
 use crate::rules::{self, KnownAction, KNOWN_LOCATIONS, SPECIAL_EXTS};
 use crate::scan::path_size;
 use serde::{Deserialize, Serialize};
@@ -21,6 +22,13 @@ pub struct SuggestOptions {
     pub find_duplicates: bool,
     /// Paths never suggested, including everything inside them.
     pub ignored: Vec<PathBuf>,
+    /// Extra folders treated like Program Files (never suggested). The real
+    /// Program Files / ProgramData / AppData and game libraries are always
+    /// guarded; this adds to them.
+    pub guarded_dirs: Vec<PathBuf>,
+    /// Extra cloud-synced roots, added to the OneDrive folders found on the
+    /// machine. Files in them are never suggested for archiving.
+    pub synced_dirs: Vec<PathBuf>,
 }
 
 impl Default for SuggestOptions {
@@ -34,6 +42,8 @@ impl Default for SuggestOptions {
             downloads_days: 60,
             find_duplicates: true,
             ignored: Vec::new(),
+            guarded_dirs: Vec::new(),
+            synced_dirs: Vec::new(),
         }
     }
 }
@@ -48,8 +58,48 @@ fn now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
+/// What scan-derived suggestions must stay away from: installed software and
+/// app data (moving it breaks things) and cloud-synced folders (moving a file
+/// out deletes it from the cloud too).
+pub struct Guards {
+    software: Vec<(PathBuf, protect::Guarded)>,
+    synced: Vec<PathBuf>,
+}
+
+impl Guards {
+    pub fn new(opts: &SuggestOptions) -> Self {
+        let mut software = protect::software_roots();
+        software.extend(opts.guarded_dirs.iter().map(|p| (p.clone(), protect::Guarded::ProgramFiles)));
+        let mut synced = protect::onedrive_roots();
+        synced.extend(opts.synced_dirs.iter().cloned());
+        Self { software, synced }
+    }
+
+    /// Why `p` can't be part of a scan-derived suggestion, if it can't.
+    pub fn software(&self, p: &Path) -> Option<&'static str> {
+        protect::guarded_in(p, &self.software).map(|g| g.reason())
+    }
+
+    pub fn synced(&self, p: &Path) -> bool {
+        protect::in_synced(p, &self.synced)
+    }
+}
+
+/// Suggestions found by looking through the scan (as opposed to the named
+/// cache locations in `rules.rs`). Only these are subject to `Guards`.
+pub fn is_scan_derived(id: &str) -> bool {
+    matches!(id, "stale" | "duplicates" | "downloads") || id.starts_with("regen:") || id.starts_with("ext:")
+}
+
+/// Of those, the ones meant to archive things you own rather than clear junk:
+/// removing a synced file here deletes it from the cloud as well.
+pub fn is_archive_like(id: &str) -> bool {
+    matches!(id, "stale" | "duplicates" | "downloads")
+}
+
 pub fn suggest(scan: &ScanResult, opts: &SuggestOptions) -> Report {
     let mut out = Vec::new();
+    let guards = Guards::new(opts);
 
     // 1. Known cache / junk locations
     for loc in KNOWN_LOCATIONS {
@@ -88,7 +138,7 @@ pub fn suggest(scan: &ScanResult, opts: &SuggestOptions) -> Report {
     // 2. Regenerable dev folders, one suggestion per rule
     let mut regen: HashMap<&'static str, Vec<Located>> = HashMap::new();
     for ch in &scan.root.children {
-        collect_regen(ch, scan.root_path.join(&ch.name), opts.regen_min, &mut regen);
+        collect_regen(ch, scan.root_path.join(&ch.name), opts.regen_min, &guards, &mut regen);
     }
     for (id, mut items) in regen {
         let rule = rules::regen_rule(id).expect("rule");
@@ -116,11 +166,15 @@ pub fn suggest(scan: &ScanResult, opts: &SuggestOptions) -> Report {
         if bytes < opts.min_bytes {
             continue;
         }
-        let mut items: Vec<Located> = files.iter().map(|f| Located { path: f.path.clone(), bytes: f.size }).collect();
+        let mut items: Vec<Located> = files.iter().filter(|f| guards.software(&f.path).is_none()).map(|f| Located { path: f.path.clone(), bytes: f.size }).collect();
+        let bytes: u64 = items.iter().map(|i| i.bytes).sum();
+        if bytes < opts.min_bytes {
+            continue;
+        }
         items.sort_unstable_by(|a, b| b.bytes.cmp(&a.bytes));
         out.push(Suggestion {
             id: format!("ext:{id}"),
-            title: format!("{} — {} file{}", rule.label, files.len(), if files.len() == 1 { "" } else { "s" }),
+            title: format!("{} — {} file{}", rule.label, items.len(), if items.len() == 1 { "" } else { "s" }),
             bytes,
             safety: rule.safety,
             how: rule.how.into(),
@@ -137,6 +191,7 @@ pub fn suggest(scan: &ScanResult, opts: &SuggestOptions) -> Report {
         .iter()
         .filter(|f| f.size >= opts.stale_min && f.modified > 0 && f.modified < cutoff)
         .filter(|f| !is_system_file(&f.path))
+        .filter(|f| guards.software(&f.path).is_none() && !guards.synced(&f.path))
         .map(|f| Located { path: f.path.clone(), bytes: f.size })
         .collect();
     let bytes: u64 = stale.iter().map(|i| i.bytes).sum();
@@ -154,7 +209,8 @@ pub fn suggest(scan: &ScanResult, opts: &SuggestOptions) -> Report {
     }
 
     // 5. Old Downloads
-    if let Some(items) = old_downloads(opts.downloads_days) {
+    if let Some(mut items) = old_downloads(opts.downloads_days) {
+        items.retain(|i| guards.software(&i.path).is_none() && !guards.synced(&i.path));
         let bytes: u64 = items.iter().map(|i| i.bytes).sum();
         if bytes >= opts.min_bytes {
             out.push(Suggestion {
@@ -171,7 +227,14 @@ pub fn suggest(scan: &ScanResult, opts: &SuggestOptions) -> Report {
     }
 
     // 6. Duplicates
-    let duplicates = if opts.find_duplicates { find_duplicates(&scan.big_files, opts.dup_min) } else { Vec::new() };
+    // Files in installed software or in OneDrive never take part: the copy
+    // that gets moved is the one that would break something or vanish from the cloud.
+    let duplicates = if opts.find_duplicates {
+        let eligible: Vec<FileEntry> = scan.big_files.iter().filter(|f| guards.software(&f.path).is_none() && !guards.synced(&f.path)).cloned().collect();
+        find_duplicates(&eligible, opts.dup_min)
+    } else {
+        Vec::new()
+    };
     let wasted: u64 = duplicates.iter().map(|g| g.wasted).sum();
     if wasted >= opts.min_bytes {
         let items = duplicates
@@ -209,8 +272,8 @@ pub fn is_permanent(id: &str, action: &Action) -> bool {
     }
 }
 
-fn collect_regen(node: &DirNode, path: PathBuf, min: u64, out: &mut HashMap<&'static str, Vec<Located>>) {
-    if node.size < min {
+fn collect_regen(node: &DirNode, path: PathBuf, min: u64, guards: &Guards, out: &mut HashMap<&'static str, Vec<Located>>) {
+    if node.size < min || guards.software(&path).is_some() {
         return;
     }
     if let Some(id) = node.regen_rule {
@@ -218,7 +281,7 @@ fn collect_regen(node: &DirNode, path: PathBuf, min: u64, out: &mut HashMap<&'st
         return;
     }
     for ch in &node.children {
-        collect_regen(ch, path.join(&ch.name), min, out);
+        collect_regen(ch, path.join(&ch.name), min, guards, out);
     }
 }
 

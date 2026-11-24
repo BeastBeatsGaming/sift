@@ -473,3 +473,7 @@ input[type="checkbox"], input[type="radio"] { accent-color: var(--accent); width
 .watch .readout { gap: 6px !important; }
 .cat-list .row { padding: 11px 18px; gap: 18px; }
 @media (max-width: 1240px) { .hero-stat { padding: 2px 20px; min-width: 0; } .hero-side > .btn { margin-left: 20px; } }
+
+/* ---------- confirm-dialog warning line (OneDrive) */
+.warn-text { color: var(--warn); margin: 10px 0 0; }
+.notice.notice-row { margin-bottom: 16px; }

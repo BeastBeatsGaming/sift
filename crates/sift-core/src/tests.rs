@@ -10,7 +10,7 @@ fn write(p: &Path, bytes: usize, fill: u8) {
 fn small_opts() -> (ScanOptions, SuggestOptions) {
     (
         ScanOptions { big_file_min: 1000, threads: 2 },
-        SuggestOptions { min_bytes: 1, regen_min: 1, dup_min: 1000, stale_min: 1000, stale_days: 365, downloads_days: 60, find_duplicates: true, ignored: vec![] },
+        SuggestOptions { min_bytes: 1, regen_min: 1, dup_min: 1000, stale_min: 1000, stale_days: 365, downloads_days: 60, find_duplicates: true, ignored: vec![], guarded_dirs: vec![], synced_dirs: vec![] },
     )
 }
 
@@ -332,4 +332,238 @@ fn only_trash_moves_are_undoable() {
     assert!(is_permanent("windows_old", &Action::OpenSettings { uri: "ms-settings:storagepolicies".into() }));
     assert!(is_permanent("recycle_bin", &Action::Manual));
     assert!(!is_permanent("hiberfil", &Action::Manual));
+}
+
+// ------------------------------------------- installed software & cloud sync
+
+fn age(p: &Path, days: u64) {
+    let t = std::time::SystemTime::now() - std::time::Duration::from_secs(days * 86_400);
+    fs::File::options().write(true).open(p).unwrap().set_modified(t).unwrap();
+}
+
+#[test]
+fn guarded_locations_are_recognised() {
+    use crate::protect::{guarded_in, Guarded};
+    let roots = vec![(Path::new("/c/Program Files").to_path_buf(), Guarded::ProgramFiles), (Path::new("/c/Users/a/AppData/Local").to_path_buf(), Guarded::AppData)];
+    assert_eq!(guarded_in(Path::new("/c/Program Files/nodejs/node_modules"), &roots), Some(Guarded::ProgramFiles));
+    assert_eq!(guarded_in(Path::new("/c/Users/a/AppData/Local/Packages/x/LocalState/ext4.vhdx"), &roots), Some(Guarded::AppData));
+    assert_eq!(guarded_in(Path::new("/d/SteamLibrary/steamapps/common/Game/data.pak"), &roots), Some(Guarded::GameLibrary));
+    assert_eq!(guarded_in(Path::new("/d/SteamLibrary/steamapps/workshop/content/1"), &roots), Some(Guarded::GameLibrary));
+    assert_eq!(guarded_in(Path::new("/d/Epic Games/Fortnite/x.pak"), &roots), Some(Guarded::GameLibrary));
+    // shader cache lives in steamapps but isn't game data; the folder named like a root isn't inside it
+    assert_eq!(guarded_in(Path::new("/d/SteamLibrary/steamapps/shadercache/1"), &roots), None);
+    assert_eq!(guarded_in(Path::new("/c/Program Files Backup/x"), &roots), None);
+    assert_eq!(guarded_in(Path::new("/c/Users/a/Documents/big.iso"), &roots), None);
+}
+
+#[test]
+fn scan_suggestions_stay_out_of_installed_software() {
+    let t = fixture();
+    let r = t.path();
+    // an app that ships its own node_modules, a crash dump and a big old file in AppData,
+    // and the same video as in `media/` hidden inside Program Files
+    write(&r.join("pf/nodejs/node_modules/npm/index.js"), 5000, 1);
+    write(&r.join("pf/app/crash.dmp"), 2000, 1);
+    write(&r.join("pf/app/clip.mp4"), 2500, 6);
+    write(&r.join("appdata/Packages/distro/ext4.vhdx"), 3000, 1);
+    age(&r.join("appdata/Packages/distro/ext4.vhdx"), 800);
+    write(&r.join("docs/old-render.bin"), 3000, 2);
+    age(&r.join("docs/old-render.bin"), 800);
+
+    let (so, mut sg) = small_opts();
+    sg.guarded_dirs = vec![r.join("pf"), r.join("appdata")];
+    let s = scan(r, &so, &Progress::default());
+    let rep = suggest(&s, &sg);
+    let in_guarded = |p: &Path| p.starts_with(r.join("pf")) || p.starts_with(r.join("appdata"));
+
+    for sug in rep.suggestions.iter().filter(|x| crate::suggest::is_scan_derived(&x.id)) {
+        assert!(sug.items.iter().all(|i| !in_guarded(&i.path)), "{} lists {:?}", sug.id, sug.items);
+    }
+    assert!(rep.duplicates.iter().all(|g| g.paths.iter().all(|p| !in_guarded(p))));
+    // the real ones are still found
+    assert!(rep.suggestions.iter().any(|x| x.id == "regen:node_modules" && x.items.iter().any(|i| i.path.ends_with("web/app/node_modules"))));
+    let stale = rep.suggestions.iter().find(|x| x.id == "stale").expect("old render is stale");
+    assert_eq!(stale.items.len(), 1);
+    assert!(stale.items[0].path.ends_with("docs/old-render.bin"));
+    assert!(rep.suggestions.iter().all(|x| x.id != "ext:dumps"), "the only .dmp is inside Program Files");
+    assert_eq!(rep.duplicates.len(), 1);
+    assert_eq!(rep.duplicates[0].paths.len(), 2, "media copies only");
+}
+
+#[test]
+fn synced_files_are_never_archived_or_deduplicated() {
+    use crate::protect::in_synced;
+    let t = fixture();
+    let r = t.path();
+    write(&r.join("OneDrive/Videos/holiday.mp4"), 4000, 1);
+    age(&r.join("OneDrive/Videos/holiday.mp4"), 800);
+    write(&r.join("OneDrive/Videos/clip copy.mp4"), 2500, 6); // duplicate of media/clip.mp4
+    write(&r.join("OneDrive/proj/node_modules/lib/index.js"), 4000, 1); // junk: fine to clear
+
+    assert!(in_synced(&r.join("OneDrive/Videos/holiday.mp4"), &[r.join("OneDrive")]));
+    assert!(!in_synced(&r.join("OneDrive2/x"), &[r.join("OneDrive")]));
+
+    let (so, mut sg) = small_opts();
+    sg.synced_dirs = vec![r.join("OneDrive")];
+    let s = scan(r, &so, &Progress::default());
+    let rep = suggest(&s, &sg);
+    assert!(rep.suggestions.iter().all(|x| x.id != "stale"), "the only old file is in OneDrive");
+    let synced = |p: &Path| p.starts_with(r.join("OneDrive"));
+    assert!(rep.duplicates.iter().all(|g| g.paths.iter().all(|p| !synced(p))));
+    // regenerable junk in OneDrive is still offered
+    let nm = rep.suggestions.iter().find(|x| x.id == "regen:node_modules").unwrap();
+    assert!(nm.items.iter().any(|i| synced(&i.path)));
+    assert!(crate::suggest::is_archive_like("stale") && !crate::suggest::is_archive_like("regen:node_modules"));
+}
+
+// ---------------------------------------------------------- journal & history
+
+fn history_file(t: &tempfile::TempDir) -> std::path::PathBuf {
+    t.path().join("state/history.json")
+}
+
+#[test]
+fn interrupted_cleanup_is_settled_on_reopen() {
+    use crate::trash::{Batch, BatchKind, Entry, EntryState, History};
+    let t = fixture();
+    let moved_src = t.path().join("art/scene.blend1");
+    let stayed = t.path().join("media/other.mp4");
+    // what a crash leaves behind: both journaled as Pending, only the first one moved
+    let slot_a = t.path().join("trash/b1/0");
+    let slot_b = t.path().join("trash/b1/1");
+    fs::create_dir_all(&slot_a).unwrap();
+    fs::create_dir_all(&slot_b).unwrap();
+    fs::rename(&moved_src, slot_a.join("scene.blend1")).unwrap();
+    let entry = |o: &Path, s: std::path::PathBuf| Entry { original: o.to_path_buf(), stored: s, bytes: 10, state: EntryState::Pending };
+    let h = History {
+        batches: vec![Batch {
+            id: "b1".into(),
+            created: 1,
+            label: "x".into(),
+            kind: BatchKind::Quarantine { entries: vec![entry(&moved_src, slot_a.join("scene.blend1")), entry(&stayed, slot_b.join("other.mp4"))] },
+        }],
+    };
+    fs::create_dir_all(t.path().join("state")).unwrap();
+    fs::write(history_file(&t), serde_json::to_vec(&h).unwrap()).unwrap();
+
+    let mut tr = trash_in(&t);
+    assert!(tr.notice().unwrap().contains("middle of a cleanup"));
+    let BatchKind::Quarantine { entries } = &tr.history().batches[0].kind else { panic!() };
+    assert_eq!(entries.len(), 1, "the item that never moved is dropped");
+    assert_eq!(entries[0].state, EntryState::InTrash);
+    assert!(stayed.exists(), "never touched");
+    assert!(!slot_b.exists(), "empty slot removed");
+    // and the moved one can be restored
+    assert_eq!(tr.restore("b1").unwrap().done, 1);
+    assert!(moved_src.exists());
+    // settled state was saved: reopening shows no pending items and no new notice
+    drop(tr);
+    assert!(trash_in(&t).notice().is_none());
+}
+
+#[test]
+fn nothing_moves_if_the_journal_cannot_be_written() {
+    let t = fixture();
+    let mut tr = trash_in(&t); // opens fine: no history yet
+    fs::write(t.path().join("state"), b"a file where the history folder should be").unwrap();
+    let f = t.path().join("art/scene.blend1");
+    let o = tr.quarantine("blend", &[(f.clone(), 1200)], false);
+    assert_eq!(o.done, 0);
+    assert!(f.exists(), "file untouched");
+    assert!(o.skipped[0].reason.contains("nothing was moved"), "{}", o.skipped[0].reason);
+    assert!(tr.history().batches.is_empty());
+    let left: Vec<_> = fs::read_dir(t.path().join("trash")).map(|r| r.collect()).unwrap_or_default();
+    assert!(left.is_empty(), "no stray folders: {left:?}");
+}
+
+#[test]
+fn history_in_an_unusable_place_blocks_cleanups() {
+    let t = fixture();
+    let blocker = t.path().join("blocker");
+    fs::write(&blocker, b"x").unwrap();
+    let mut tr = crate::Trash::open(blocker.join("history.json"), t.path().join("trash"));
+    let f = t.path().join("art/scene.blend1");
+    let o = tr.quarantine("blend", &[(f.clone(), 1200)], false);
+    assert_eq!((o.done, f.exists()), (0, true));
+}
+
+#[test]
+fn damaged_history_is_set_aside_and_rebuilt_from_manifests() {
+    let t = fixture();
+    let a = t.path().join("art/scene.blend1");
+    let b = t.path().join("media/other.mp4");
+    let mut tr = trash_in(&t);
+    tr.quarantine("first", &[(a.clone(), 1200)], false);
+    let after_first = fs::read(history_file(&t)).unwrap();
+    tr.quarantine("second", &[(b.clone(), 2500)], false);
+    let bak = history_file(&t).with_extension("json.bak");
+    assert!(bak.exists(), "previous version kept");
+    fs::write(&bak, after_first).unwrap(); // as if Sift died before the second save landed
+    drop(tr);
+
+    // garbage where the history was
+    fs::write(history_file(&t), b"{ not json").unwrap();
+    let mut tr = trash_in(&t);
+    assert!(tr.notice().unwrap().contains("damaged"));
+    assert!(tr.needs_recovery());
+    let kept: Vec<_> = fs::read_dir(t.path().join("state")).unwrap().flatten().filter(|e| e.file_name().to_string_lossy().starts_with("history.corrupt-")).collect();
+    assert_eq!(kept.len(), 1, "damaged file kept, not overwritten");
+    assert_eq!(fs::read(kept[0].path()).unwrap(), b"{ not json");
+
+    // the .bak knew about the first cleanup; the manifests know about both
+    assert_eq!(tr.history().batches.len(), 1);
+    assert_eq!(tr.recover_from_manifests(&[]), 1);
+    assert_eq!(tr.history().batches.len(), 2);
+    assert_eq!(tr.bytes_in_trash(), 1200 + 2500);
+    assert!(!tr.needs_recovery());
+    let id = tr.history().batches[1].id.clone();
+    assert_eq!(tr.restore(&id).unwrap().done, 1);
+    assert!(b.exists());
+    // the repaired file is valid again
+    drop(tr);
+    let tr = trash_in(&t);
+    assert!(tr.notice().is_none());
+    assert_eq!(tr.history().batches.len(), 2);
+}
+
+#[test]
+fn damaged_history_with_no_backup_still_recovers() {
+    let t = fixture();
+    let a = t.path().join("art/scene.blend1");
+    let mut tr = trash_in(&t);
+    tr.quarantine("only", &[(a.clone(), 1200)], false);
+    drop(tr);
+    fs::remove_file(history_file(&t).with_extension("json.bak")).ok();
+    fs::write(history_file(&t), b"\0\0\0").unwrap();
+
+    let mut tr = trash_in(&t);
+    assert!(tr.history().batches.is_empty());
+    assert_eq!(tr.recover_from_manifests(&[]), 1);
+    assert_eq!(tr.bytes_in_trash(), 1200);
+    let id = tr.history().batches[0].id.clone();
+    assert_eq!(tr.restore(&id).unwrap().done, 1);
+    assert!(a.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn unreadable_history_blocks_cleanups_instead_of_being_overwritten() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = fixture();
+    let mut tr = trash_in(&t);
+    tr.quarantine("one", &[(t.path().join("art/scene.blend1"), 1200)], false);
+    drop(tr);
+    let h = history_file(&t);
+    fs::set_permissions(&h, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(&h).is_ok() {
+        return; // running as root: can't make a file unreadable
+    }
+    let mut tr = trash_in(&t);
+    assert!(tr.notice().unwrap().contains("can't read"));
+    let f = t.path().join("media/other.mp4");
+    let o = tr.quarantine("two", &[(f.clone(), 2500)], false);
+    assert_eq!(o.done, 0);
+    assert!(f.exists());
+    fs::set_permissions(&h, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(trash_in(&t).history().batches.len(), 1, "history untouched");
 }

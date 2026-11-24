@@ -10,6 +10,8 @@ export function useTrash() {
     async (paths: string[], size: number, label: string): Promise<boolean> => {
       if (paths.length === 0) return false;
       const one = paths.length === 1;
+      // OneDrive removes a file from the cloud when it's moved out of its folder
+      const synced = await api.syncedAmong(paths).catch(() => [] as string[]);
       const ok = await fb.confirm({
         title: one ? "Move to .sift-trash?" : `Move ${count(paths.length)} items to .sift-trash?`,
         body: (
@@ -18,13 +20,21 @@ export function useTrash() {
             <p className="muted">
               {bytes(size)} · You can undo this from History. The space is freed when the trash is emptied.
             </p>
+            {synced.length > 0 && (
+              <p className="warn-text">
+                {synced.length === paths.length ? (one ? "This file is" : `All ${count(synced.length)} items are`) : `${count(synced.length)} of these are`} in
+                OneDrive. Moving {synced.length === 1 ? "it" : "them"} out deletes {synced.length === 1 ? "it" : "them"} from OneDrive too — on the web and
+                your other devices — until Undo puts {synced.length === 1 ? "it" : "them"} back, which uploads {synced.length === 1 ? "it" : "them"} again.
+              </p>
+            )}
           </>
         ),
-        confirm: "Move to trash",
+        confirm: synced.length > 0 ? "Move and delete from OneDrive" : "Move to trash",
+        danger: synced.length > 0,
       });
       if (!ok) return false;
       try {
-        fb.report(await api.quarantinePaths(paths, label));
+        fb.report(await api.quarantinePaths(paths, label, synced.length > 0));
         return true;
       } catch (err) {
         fb.toast({ text: String(err), tone: "alert" });
